@@ -44,6 +44,7 @@ from .dialect_lowering import (
 
 from .layout_inference import (
     infer_layout as infer_layout,
+    remove_unused_vector_loads as remove_unused_vector_loads,
 )
 
 from .layouts import (

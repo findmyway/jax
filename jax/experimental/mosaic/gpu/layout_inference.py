@@ -762,3 +762,17 @@ def infer_layout(module: ir.Module):
 
   for op in module.body:
     traverse_op(op, set_default_layout)
+
+# There are cases where the layout inference fails to compute a default layout
+# when there are unsused vector loads (generated as part of a swap). For
+# example, this happens when there is any load of a shape is < 128
+# (warpgroup size) such as WGMMA_ROW or WGMMA_COL. For these we would have to
+# use a tiled layout, but so far we only infer strided layouts. This pass
+# removes these unused loads and is meant as a temporary solution, until we
+# rewrite the layout inference to handle these cases.
+def remove_unused_vector_loads(module: ir.Module):
+  def remove_unused(op: ir.OpView):
+    if op.name == "vector.load" and next(op.result.uses, None) is None:
+      op.erase()
+  for op in module.body:
+    traverse_op(op, remove_unused)
