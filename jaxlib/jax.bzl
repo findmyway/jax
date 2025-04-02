@@ -100,6 +100,7 @@ _py_deps = {
     "tensorstore": get_optional_dep("@pypi//tensorstore"),
     "torch": [],
     "zstandard": get_zstandard(),
+    "libnvshmem_device": [],
 }
 
 def all_py_deps(excluded = []):

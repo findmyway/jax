@@ -40,6 +40,7 @@ from jaxlib.mlir.dialects import memref
 from jaxlib.mlir.dialects import nvvm
 import numpy as np
 
+
 # mypy: ignore-errors
 
 from . import dialect_lowering
@@ -82,15 +83,33 @@ if RUNTIME_PATH and RUNTIME_PATH.exists():
   # Set this so that the custom call can find it
   os.environ["MOSAIC_GPU_RUNTIME_LIB_PATH"] = str(RUNTIME_PATH)
 
-if os.environ.get("MOSAIC_GPU_NVSHMEM_LLVM_LIB_PATH") is None:
-  try:
-    from nvidia import nvshmem
-  except ImportError:
-    pass
-  else:
-    os.environ["MOSAIC_GPU_NVSHMEM_LLVM_LIB_PATH"] = (
-      os.path.join(nvshmem.__path__[0], 'lib/libnvshmem_device.bc')
+
+try:
+  from nvidia import nvshmem
+except ImportError:
+  pass
+else:
+  if os.environ.get("MOSAIC_GPU_NVSHMEM_BC_PATH") is None:
+    os.environ["MOSAIC_GPU_NVSHMEM_BC_PATH"] = os.path.join(
+        nvshmem.__path__[0], "lib/libnvshmem_device.bc"
     )
+  if os.environ.get("MOSAIC_GPU_NVSHMEM_SO_PATH") is None:
+    os.environ["MOSAIC_GPU_NVSHMEM_SO_PATH"] = os.path.join(
+        nvshmem.__path__[0], "lib/libnvshmem_host.so.3"
+    )
+
+
+def supports_cross_device_collectives():
+  try:
+    nvshmem_bc_path = os.environ["MOSAIC_GPU_NVSHMEM_BC_PATH"]
+  except KeyError:
+    return False
+  xla_flags = os.environ.get("XLA_FLAGS", "")
+  return (
+      os.path.exists(nvshmem_bc_path)
+      and "--xla_gpu_experimental_enable_nvshmem" in xla_flags
+  )
+
 
 mosaic_gpu_p = jax._src.core.Primitive("mosaic_gpu_p")
 mosaic_gpu_p.multiple_results = True
@@ -389,6 +408,7 @@ def _launch(
     scratch_arr,
     smem_buffers: ShapeTree | Union[ShapeTree],
     lowering_semantics: LoweringSemantics,
+    module: ir.Module,
     profiler_spec: profiler.ProfilerSpec | None = None,
     maybe_prof_buffer: ir.Value | None = None,
 ):
@@ -457,7 +477,7 @@ def _launch(
 
     ptr_ty = ir.Type.parse("!llvm.ptr")
     scratch_ptr = builtin.unrealized_conversion_cast([ptr_ty], [scratch_arr])
-    ctx = launch_context.LaunchContext(launch_op, scratch_ptr, cluster, prof)
+    ctx = launch_context.LaunchContext(module, launch_op, scratch_ptr, cluster, prof)
     with ctx.named_region("Init"):
       tmem_allocs: list[_TMEMAlloc] = []
       smem_ref_tree_thunk = _construct_smem_reftree(
@@ -563,7 +583,7 @@ def _lower_as_gpu_kernel(
       scratch_arr = llvm.load(empty_arr_ty, scratch_alloc.result)
       with _launch(
           token, grid, cluster, block, scratch_arr, smem_scratch_shape,
-          lowering_semantics, prof_spec, prof_buffer
+          lowering_semantics, module, prof_spec, prof_buffer
       ) as (_launch_ctx, smem_refs):
         nonlocal launch_ctx
         launch_ctx = _launch_ctx
@@ -669,6 +689,9 @@ def as_gpu_kernel(
   _initialize_scratch(launch_ctx, scratch_arr)
   module.operation.verify()
 
+  if launch_ctx.is_device_collective and not supports_cross_device_collectives():
+    raise RuntimeError("Kernel is a cross-device collective but no support is available.")
+
   expected_arg_treedef = jax.tree.structure(in_shape)
   def _check_args(*args):
     arg_treedef = jax.tree.structure(args)
@@ -751,6 +774,9 @@ def as_torch_gpu_kernel(
 
   _initialize_scratch(launch_ctx, scratch_arr)
   module.operation.verify()
+
+  if launch_ctx.is_device_collective:
+    raise RuntimeError("Kernel is a cross-device collective but no support is available.")
 
   # Get our hands on the compilation and unload functions
   try:
