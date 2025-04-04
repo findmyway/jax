@@ -2844,9 +2844,7 @@ class MiscellaneousTest(PallasBaseTest):
     )(x)
     np.testing.assert_array_equal(out, state_utils.bitcast(x, jnp.uint32))
 
-  @only_passes_in_interpret()
   def test_roll_partial(self):
-    """b/337384645"""
     x = np.arange(8192, dtype=jnp.float32).reshape(128, 64)
 
     def kernel(x_ref, out_ref):

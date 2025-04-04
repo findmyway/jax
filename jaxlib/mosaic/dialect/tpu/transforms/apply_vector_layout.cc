@@ -2209,16 +2209,25 @@ LogicalResult rotate_rule_impl(RewriteContext &ctx, OpTy op, Value amount,
   if (layout_in != layout) {
     return op.emitOpError("Not implemented: unsupported layout for input");
   }
-  if (layout_out != layout) {
+  // We support non-zero offsets in the output layout via lazy rotation.
+  if (layout_out.bitwidth() != layout.bitwidth() ||
+      layout_out.tiling() != layout.tiling() ||
+      layout_out.implicit_dim() != layout.implicit_dim()) {
     return op.emitOpError("Not implemented: unsupported layout for output");
   }
   auto vty = op.getResult().getType();
   if (vty.getRank() < 2) {
     return op.emitOpError("Not implemented: unsupported 1D shape");
   }
-  if (*(vty.getShape().end() - 2) % *(layout.tiling().end() - 2) != 0 ||
-      *(vty.getShape().end() - 1) % *(layout.tiling().end() - 1) != 0) {
-    return op.emitOpError("Not implemented: unsupported unaliged shape");
+  if (*(vty.getShape().end() - 2) % *(layout.tiling().end() - 2) != 0 &&
+      op.getDimension() == vty.getRank() - 2) {
+    return op.emitOpError(
+        "Not implemented: unsupported unaligned shape in sublane dimension");
+  }
+  if (*(vty.getShape().end() - 1) % *(layout.tiling().end() - 1) != 0 &&
+      op.getStride().has_value()) {
+    return op.emitOpError(
+        "Not implemented: unsupported unaligned shape in lane dimension");
   }
 
   ImplicitLocOpBuilder builder(op.getLoc(), op.getOperation());
@@ -2345,6 +2354,63 @@ LogicalResult rotate_rule_impl(RewriteContext &ctx, OpTy op, Value amount,
     return concatenate(chunks, axis);
   };
 
+  // Applies lazy rotation (see go/pltpu-roll for details).
+  auto lazyRotate = [&](const xla::Array<Value> &vregs, int64_t shift,
+                        int axis) {
+    const int tiling_dim = axis - (vregs.num_dimensions() - 2);
+    const int64_t tile_size = ctx.target_shape[tiling_dim];
+    const int64_t input_size = vty.getShape()[axis];
+    const int64_t normalized_shift = shift % input_size;
+    const int64_t start_idx = input_size - normalized_shift;
+    const int64_t start_vreg_idx = start_idx / tile_size;
+    const int64_t valid_amount = input_size % tile_size;
+
+    auto concat = concatenate({vregs, vregs}, axis);
+    auto chunks = split(concat, axis);
+    int64_t original_num_chunks = chunks.size() / 2;
+    xla::Array<Value> front_chunk_copy(chunks.front());
+
+    Value rotate_amount = mlirI32Const(valid_amount);
+    auto iota = builder.create<tpu::IotaOp>(
+        i32_vreg, builder.getI32IntegerAttr(tiling_dim));
+    auto mask = builder.create<arith::CmpIOp>(
+        arith::CmpIPredicate::sge, iota,
+        builder.create<arith::ConstantOp>(DenseElementsAttr::get(
+            i32_vreg, builder.getI32IntegerAttr(valid_amount))));
+    // overwrite padding in the last vreg with valid data from the first vreg.
+    chunks.back().Each([&](absl::Span<const int64_t> idxs, Value *v) {
+      *v = builder.create<arith::SelectOp>(
+          mask,
+          builder.create<tpu::DynamicRotateOp>(
+              res_vreg_ty, front_chunk_copy(idxs), rotate_amount, tiling_dim,
+              nullptr, nullptr),
+          *v);
+    });
+    // rotate the vregs starting from the middle vreg.
+    for (int64_t i = original_num_chunks; i < chunks.size(); ++i) {
+      chunks[i].Each([&](absl::Span<const int64_t> idxs, Value *v) {
+        *v = builder.create<tpu::DynamicRotateOp>(
+            res_vreg_ty, *v, rotate_amount, tiling_dim, nullptr, nullptr);
+      });
+    }
+    // blend the vregs to overwrite the padding.
+    for (int64_t i = original_num_chunks - 1; i < chunks.size() - 1; ++i) {
+      chunks[i].Each([&](absl::Span<const int64_t> idxs, Value *v) {
+        *v = builder.create<arith::SelectOp>(mask, chunks[i + 1](idxs), *v);
+      });
+    }
+    SmallVector<int64_t> result_dimensions =
+        layout_out.tileArrayImplicitShape(vty.getShape(), ctx.target_shape);
+    // assemble the result
+    xla::Array<Value> result(result_dimensions);
+    SmallVector<int64_t> starts(result.num_dimensions(), 0);
+    for (int64_t i = 0; i < result_dimensions[axis]; ++i) {
+      starts[axis] = i;
+      result.UpdateSlice(chunks[i + start_vreg_idx], starts);
+    }
+    return result;
+  };
+
   std::function<xla::Array<Value>(const xla::Array<Value> &, Value, int, int)>
       rotate;
   rotate = [&](const xla::Array<Value> &vregs, Value shift, int axis,
@@ -2353,7 +2419,15 @@ LogicalResult rotate_rule_impl(RewriteContext &ctx, OpTy op, Value amount,
     CHECK(axis >= 0 && axis < vregs.num_dimensions());
     int tiling_dim = axis - (vregs.num_dimensions() - 2);
     CHECK((tiling_dim != 1 && stride == 0) || (tiling_dim == 1 && stride >= 0));
+    const bool has_padding =
+        (tiling_dim == 0 || tiling_dim == 1) &&
+        vty.getShape()[axis] % ctx.target_shape[tiling_dim] != 0;
     SmallVector<xla::Array<Value>, 4> chunks;
+    // Handle rotation with static shift and padding lazily.
+    if (auto shift_cst = getIntConst(shift, /*silent=*/true);
+        succeeded(shift_cst) && has_padding) {
+      return lazyRotate(vregs, shift_cst.value(), axis);
+    }
     // Handle rotation with static shift.
     if (auto shift_cst = getIntConst(shift, /*silent=*/true);
         succeeded(shift_cst)) {
@@ -2445,7 +2519,7 @@ LogicalResult rotate_rule_impl(RewriteContext &ctx, OpTy op, Value amount,
       roll_by *= 2;
     }
     return result;
-  };
+  };  // end of rotate
 
   xla::Array<Value> out_tiles(in_tiles.dimensions());
   const auto dim = op.getDimension();

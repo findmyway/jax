@@ -748,6 +748,46 @@ class VectorLayoutInferer {
     return success();
   }
 
+  // Helper function to compute the layout offsets for a dynamic rotate op.
+  LayoutOffsets compute_layout_offsets(tpu::DynamicRotateOp op) {
+    LayoutOffsets layout_offsets{0, 0};
+    const unsigned int bitwidth = op.getType().getElementTypeBitWidth();
+    const auto tiling = nativeTiling(bitwidth);
+    const int tiling_dim = op.getDimension() - (op.getType().getRank() - 2);
+    if (tiling_dim != 0 && tiling_dim != 1) {
+      return layout_offsets;
+    }
+    const int64_t tile_size = tiling[tiling_dim];
+    const int64_t dim_size = op.getType().getShape()[op.getDimension()];
+    if (dim_size % tile_size == 0) {
+      return layout_offsets;
+    }
+    auto amount = op.getAmount().getDefiningOp<arith::ConstantOp>();
+    if (!amount) {
+      return layout_offsets;
+    }
+    auto integer_attr = dyn_cast<IntegerAttr>(amount.getValue());
+    if (!integer_attr) {
+      return layout_offsets;
+    }
+    if (auto stride = op.getStride(); stride.has_value() && *stride != 0) {
+      return layout_offsets;
+    }
+    if (tiling_dim != 0 && tiling_dim != 1) {
+      return layout_offsets;
+    }
+    int64_t shift_amount = integer_attr.getValue().getSExtValue();
+    // Normalize the shift amount to the dimension size.
+    shift_amount = shift_amount % dim_size;
+    CHECK_GE(shift_amount, 0);
+    CHECK_LE(shift_amount, dim_size);
+    // Absolute offset.
+    int64_t offset = dim_size - shift_amount;
+    // Convert to relative offsets within the tile.
+    layout_offsets[tiling_dim] = offset % tile_size;
+    return layout_offsets;
+  }
+
   LogicalResult infer(tpu::DynamicRotateOp op) {
     auto bitwidth = op.getType().getElementTypeBitWidth();
     // TODO(b/347067057): Support dynamic rotate with packed dtype.
@@ -759,7 +799,9 @@ class VectorLayoutInferer {
     }
     auto layout = VectorLayout(bitwidth, {0, 0}, nativeTiling(bitwidth),
                                ImplicitDim::kNone);
-    setLayout(op, {layout, kNoLayout}, layout);
+    auto out_layout = VectorLayout(bitwidth, compute_layout_offsets(op),
+                                   nativeTiling(bitwidth), ImplicitDim::kNone);
+    setLayout(op, {layout, kNoLayout}, out_layout);
     return success();
   }
 
