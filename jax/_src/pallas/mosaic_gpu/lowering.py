@@ -821,6 +821,7 @@ def lower_jaxpr_to_module(
   if lowering_semantics == mgpu.LoweringSemantics.Warpgroup:
     # Run Python lowering passes. The remaining passes will be run in C++ in
     # jax/jaxlib/mosaic/gpu/custom_call.cc
+    mgpu.remove_unused_vector_loads(module)  # pytype: disable=attribute-error
     mgpu.infer_layout(module)  # pytype: disable=attribute-error
     mgpu.infer_transforms(module)  # pytype: disable=attribute-error
     mgpu.lower_mgpu_dialect(module, launch_ctx)  # pytype: disable=attribute-error

@@ -654,6 +654,7 @@ def as_gpu_kernel(
   if thread_semantics == LoweringSemantics.Warpgroup and dialect is not None:
     # Run Python lowering passes. The remaining passes will be run in C++ in
     # jax/jaxlib/mosaic/gpu/custom_call.cc
+    layout_inference.remove_unused_vector_loads(module)  # pytype: disable=attribute-error
     layout_inference.infer_layout(module)  # pytype: disable=attribute-error
     transform_inference.infer_transforms(module)  # pytype: disable=attribute-error
     dialect_lowering.lower_mgpu_dialect(module, launch_ctx)  # pytype: disable=attribute-error
@@ -737,6 +738,7 @@ def as_torch_gpu_kernel(
   if lowering_semantics == LoweringSemantics.Warpgroup and dialect is not None:
     # Run Python lowering passes. The remaining passes will be run in C++ in
     # jax/jaxlib/mosaic/gpu/custom_call.cc
+    layout_inference.remove_unused_vector_loads(module)  # pytype: disable=attribute-error
     layout_inference.infer_layout(module)  # pytype: disable=attribute-error
     transform_inference.infer_transforms(module)  # pytype: disable=attribute-error
     dialect_lowering.lower_mgpu_dialect(module, launch_ctx)  # pytype: disable=attribute-error
