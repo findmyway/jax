@@ -92,15 +92,15 @@ def _get_memory_space_from_aval(
 
 
 def _get_memory_spaces_from_avals(
-    out_avals: tuple[jax_core.AbstractValue, ...],
+    avals: tuple[jax_core.AbstractValue, ...],
 ) -> tuple[tpu_custom_call.MemorySpace | None, ...] | None:
-  output_memory_spaces = None
+  memory_spaces = None
   if any(
       isinstance(out_aval, pallas_core.ShapedArrayWithMemorySpace)
-      for out_aval in out_avals
+      for out_aval in avals
   ):
-    output_memory_spaces = tuple(map(_get_memory_space_from_aval, out_avals))
-  return output_memory_spaces
+    memory_spaces = tuple(map(_get_memory_space_from_aval, avals))
+  return memory_spaces
 
 
 def pallas_call_tpu_lowering_rule(
@@ -217,6 +217,7 @@ def pallas_call_tpu_lowering_rule(
   dynamic_grid_args, args = in_nodes[:num_dyn_bounds], in_nodes[num_dyn_bounds:]
   kernel_ctx = ctx.replace(avals_in=kernel_in_avals, avals_out=kernel_out_avals)
   output_memory_spaces = _get_memory_spaces_from_avals(out_avals)
+  input_memory_spaces = _get_memory_spaces_from_avals(ctx.avals_in)
   if cost_estimate is not None:
     mosaic_cost_estimate = tpu_custom_call.CostEstimate(
         flops=cost_estimate.flops,
@@ -245,6 +246,7 @@ def pallas_call_tpu_lowering_rule(
       has_side_effects=mosaic_params.has_side_effects,
       output_memory_spaces=output_memory_spaces,
       disable_bounds_checks=mosaic_params.disable_bounds_checks,
+      input_memory_spaces=input_memory_spaces
   )
   _maybe_cast_to_bool = lambda x, aval: x.astype(
       jax.numpy.bool_) if aval.dtype == jax.numpy.bool_ else x
