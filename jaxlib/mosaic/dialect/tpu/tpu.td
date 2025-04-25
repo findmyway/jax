@@ -245,6 +245,20 @@ def TPU_VectorStoreOp :TPU_Op<"vector_store", [DefaultMemWrite, AttrSizedOperand
   let hasVerifier = 1;
 }
 
+def TPU_VectorLoadOp :TPU_Op<"vector_load", [DefaultMemRead, AttrSizedOperandSegments]> {
+  let arguments = (ins
+    AnyMemRef:$base,
+    Variadic<Index>:$indices,
+    DenseI32ArrayAttr:$strides,
+    Optional<AnyVectorOfNonZeroRank>:$mask   // Elementwise mask.
+  );
+  let results = (outs AnyVectorOfNonZeroRank:$result);
+  let assemblyFormat = [{
+    $base `[` $indices `]` (`masked` $mask^)? attr-dict `:` type($base) `,` type($result) `,` type($mask)
+  }];
+  let hasVerifier = 1;
+}
+
 def TPU_StridedLoadOp : TPU_Op<"strided_load", [DefaultMemRead]> {
   let arguments = (ins
     AnyMemRef:$base,
