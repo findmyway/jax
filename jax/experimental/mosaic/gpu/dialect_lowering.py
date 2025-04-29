@@ -398,6 +398,7 @@ def _vector_store_op_lowering_rule(
       vector_store_op.valueToStore, to_store_layout
   )
 
+  mgpu.warpgroup_barrier()  # Make sure the reads have completed.
   if fragmented_array.layout == fa.WGMMA_LAYOUT:
     swizzle, transforms = swizzle_and_transforms_from_transforms_attr(
         inference_utils.in_transforms(vector_store_op)[0]
@@ -416,6 +417,7 @@ def _vector_store_op_lowering_rule(
     raise ValueError(
         f"{vector_store_op} has an unsupported layout: {to_store_layout}"
     )
+  mgpu.warpgroup_barrier()  # Make sure the writes have completed.
 
   return []
 
