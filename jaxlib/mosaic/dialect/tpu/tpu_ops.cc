@@ -22,6 +22,7 @@ limitations under the License.
 #include "absl/log/check.h"
 #include "absl/strings/str_format.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -178,10 +179,6 @@ LogicalResult MemRefSqueezeOp::verify() {
     this->emitOpError("Element types don't match.");
     return failure();
   }
-  if (!HasMemorySpace(source_type, tpu::MemorySpace::kSemaphoreMem) &&
-      source_type.getRank() > 1 && target_type.getRank() == 1) {
-    return emitError("Not implemented: squeeze memref to 1d.");
-  }
   auto source_shape = source_type.getShape();
   auto target_shape = target_type.getShape();
   int source_index = source_shape.size() - 1;
@@ -210,6 +207,18 @@ LogicalResult MemRefSqueezeOp::verify() {
        source_index--;
     }
   }
+  bool target_is_1d = target_shape.size() == 1;
+
+  auto erase_layout = getInput().getDefiningOp<tpu::EraseLayoutOp>();
+  if (erase_layout) {
+    auto layout_ref = erase_layout.getOperand();
+    MemRefType layout_ty = layout_ref.getType();
+    auto old_layout = dyn_cast<tpu::TiledLayoutAttr>(layout_ty.getLayout());
+    if (target_is_1d && old_layout.getTiles().size() != 1) {
+      emitOpError("Expected a single tiling level for 1D target shape.");
+      return failure();
+    }
+  }
   return success();
 }
 
@@ -235,28 +244,65 @@ LogicalResult MemRefSqueezeOp::canonicalize(MemRefSqueezeOp op,
                                     target_strides.end());
   // We want to remove all strides that correspond to squeezed dimensions and
   // update the corresponding output layout.
+  bool target_is_1d = target_shape.size() == 1;
+  bool single_tile = old_layout.getTiles().size() == 1;
+
+  SmallVector<int64_t> tile_dims;
+  if (target_is_1d && single_tile) {
+    tile_dims = llvm::to_vector(old_layout.getTiles().front().dimensions());
+  }
+
   while (source_index >= 0 || target_index >= 0) {
     int target_dim = target_index < 0 ? -1 : target_shape[target_index];
-    int source_dim = source_shape[source_index];
+    int source_dim = source_index < 0 ? -1 : source_shape[source_index];
     if (source_dim == target_dim) {
-       source_index--;
-       target_index--;
+      source_index--;
+      target_index--;
     } else {
-       // Source index must be 1 here (otherwise verification will have failed).
-       // We are safe to mutate the strides vector here because we are looping
-       // backwards.
-       tile_strides.erase(tile_strides.begin() + source_index);
-       source_index--;
+      // Source index must be 1 here (otherwise verification will have failed).
+      // We are safe to mutate the strides vector here because we are looping
+      // backwards.
+      tile_strides.erase(tile_strides.begin() + source_index);
+      if (target_is_1d && single_tile) {
+        auto tile = old_layout.getTiles().front();
+        int first_tiled = source_shape.size() - tile.dimensions().size();
+        if (source_index >= first_tiled) {
+          int tile_idx = source_index - first_tiled;
+          // Verify the tile dim we're erasing is 1-sized, otherwise we would
+          // need to scale the stride to keep logical distance invariant.
+          if (tile_dims[tile_idx] != 1) {
+            return op.emitOpError()
+                   << "Cannot squeeze non-size-1 tiled dimension atindex "
+                   << tile_idx << " with size " << tile_dims[tile_idx];
+          }
+          tile_dims.erase(tile_dims.begin() + tile_idx);
+        }
+      }
+      source_index--;
     }
   }
-  auto new_layout = tpu::TiledLayoutAttr::get(
-      source_type.getContext(), old_layout.getTiles(), tile_strides);
-  auto new_result_type = MemRefType::get(op.getResult().getType().getShape(),
-                                         layout_ty.getElementType(), new_layout,
-                                         layout_ty.getMemorySpace());
-  auto squeeze = rewriter.create<MemRefSqueezeOp>(op.getLoc(), new_result_type,
-                                                  layout_ref);
-  rewriter.replaceOpWithNewOp<EraseLayoutOp>(op, op.getType(), squeeze);
+
+  if (source_index != -1 || target_index != -1) {
+    return op.emitOpError()
+           << "Source shape: " << shapeToString(source_shape)
+           << " to target shape: " << shapeToString(target_shape)
+           << " is not valid.";
+  }
+
+  tpu::TiledLayoutAttr new_layout;
+  if (target_is_1d) {
+    new_layout = tpu::TiledLayoutAttr::get(
+        op.getContext(), {xla::Tile(tile_dims)}, tile_strides);
+  } else {
+    new_layout = tpu::TiledLayoutAttr::get(op.getContext(),
+                                           old_layout.getTiles(), tile_strides);
+  }
+
+  auto new_type = MemRefType::get(target_shape, layout_ty.getElementType(),
+                                  new_layout, layout_ty.getMemorySpace());
+  auto squeeze =
+      rewriter.create<MemRefSqueezeOp>(op.getLoc(), new_type, layout_ref);
+  rewriter.replaceOpWithNewOp<tpu::EraseLayoutOp>(op, target_type, squeeze);
   return success();
 }
 
