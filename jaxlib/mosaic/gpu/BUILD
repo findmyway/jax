@@ -27,6 +27,14 @@ py_library(
 )
 
 cc_library(
+    name = "mosaic_gpu_kernels",
+    deps = [
+        ":custom_call",
+        ":runtime",
+    ],
+)
+
+cc_library(
     name = "target",
     srcs = ["target.cc"],
     hdrs = ["target.h"],
