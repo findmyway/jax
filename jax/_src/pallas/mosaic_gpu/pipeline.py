@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Sequence, Protocol
 import dataclasses
 import functools
 import itertools as it
@@ -378,6 +378,21 @@ def emit_pipeline(
   return pipeline
 
 
+class PipelineFn(Protocol):
+  """Protocol for a pipeline callback function.
+
+  Calling a PipelineFn with the initial carries as arguments will run the
+  pipeline and return the final carry.
+  """
+  def __call__(self, *initial_carries: Any) -> Sequence[Any]:
+    ...
+
+
+class CarryCallback(Protocol):
+  def __call__(self, pipeline: PipelineFn) -> None:
+    ...
+
+
 def emit_pipeline_warp_specialized(
     body: Callable[..., None],
     *,
@@ -389,7 +404,7 @@ def emit_pipeline_warp_specialized(
     wg_axis: str,
     num_compute_wgs: int,
     manual_consumed_barriers: bool = False,
-    carry_coroutine: Any | None = None,
+    carry_callback: CarryCallback | None = None,
     memory_thread_idx: int | None = None,
 ):
   """Creates a function to emit a warp-specialized pipeline.
@@ -402,7 +417,7 @@ def emit_pipeline_warp_specialized(
   def body(indices, *input_refs, *output_refs, [consumed_barriers]) -> None:
   ```
 
-  or with a carries enabled (enabled via the ``carry_coroutine`` argument),
+  or with a carries enabled (enabled via the ``carry_callback`` argument),
   where the body returns the next carry:
 
   ```
@@ -425,11 +440,15 @@ def emit_pipeline_warp_specialized(
     manual_consumed_barriers: If True, consumed barriers will be
       passed into the body function after the output refs. There will be one
       barrier per input and will be passed in the same order.
-    carry_coroutine: If specified, enables carries in the pipeline.
-      The signature of the body function will be modified such that the last
-      argument will be the current carry and it must return the next carry.
-      The coroutine itself should yield the initial carry, and the
-      yield statement will return the final value of the carry.
+    carry_callback: If specified, enables carries in the pipeline and allows
+      a user-specified prologue/epilogue that is only executed in the compute
+      thread. The signature of the pipeline body function will be modified
+      such that the last argument will be the current carry and it must
+      return the next carry.
+      The carry_callback itself should follow the signature of `CarryCallback`
+      and take a pipeline function as its sole argument. Calling the
+      pipeline with the initial carry will run the pipeline and return the
+      final carry.
     memory_thread_idx: The index of the memory thread. If not specified,
       defaults to the last thread.
   """
@@ -443,7 +462,7 @@ def emit_pipeline_warp_specialized(
     # thread is the last thread.
     raise NotImplementedError("Memory thread must be the last thread.")
 
-  has_carry = carry_coroutine is not None
+  has_carry = carry_callback is not None
 
   # Trace the index maps to determine if they depend on the grid.
   # Grid-independent values will not be multiple-buffered.
@@ -622,25 +641,26 @@ def emit_pipeline_warp_specialized(
       ]
 
       if has_carry:
-        _carry = carry_coroutine()
-        try:
-          carry_init = next(_carry)
-        except StopIteration:
-          raise ValueError("carry_coroutine must yield the initial carry.")  # pylint: disable=raise-missing-from
+        last_indices = None
+        def pipeline_callback(*user_init_carry):
+          nonlocal last_indices
+          if last_indices is not None:
+            raise ValueError(
+              "Cannot call pipeline more than once in `carry_callback`")
+          init_loop_carry = (init_indices, last_store_slices, user_init_carry)
+          last_indices, _, final_body_carry = lax.fori_loop(0,
+                        num_steps,
+                        compute_loop_body,
+                        init_loop_carry)
+          return final_body_carry
+        carry_callback(pipeline_callback)
+        if last_indices is None:
+          raise ValueError("Pipeline was not called in `carry_callback`")
       else:
-        _carry = None
-        carry_init = None
-      init_loop_carry = (init_indices, last_store_slices, carry_init)
-      last_indices, _, final_body_carry = lax.fori_loop(0,
-                    num_steps,
-                    compute_loop_body,
-                    init_loop_carry)
-      if has_carry:
-        try:
-          _carry.send(final_body_carry)  # pytype: disable=attribute-error
-          raise ValueError("carry_coroutine must only yield once.")
-        except StopIteration:
-          pass
+        last_indices, _, _ = lax.fori_loop(
+            0, num_steps, compute_loop_body,
+            (init_indices, last_store_slices, None)
+        )
 
       # Handle index_invariant outputs after the loop. They are not
       # written in the main pipeline loop.
