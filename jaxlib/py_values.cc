@@ -990,12 +990,6 @@ absl::StatusOr<DevicePutResult> DevicePutWithSharding(
   // Whether to build an IFRT array from host buffers as a single batch. We do
   // not batch any shard is already an IFRT array.
   bool should_batch = true;
-#if JAX_IFRT_VERSION_NUMBER < 2
-  // PjRt-IFRT would fail `xla::ifrt::Client::MakeArrayFromHostBuffer()` invoked
-  // by `xla::ifrt::ClientMakeArraysFromHostBufferShards()` for a fully
-  // replicated sharding if the sharding has any non-addressable device.
-  should_batch = false;
-#endif
 
   std::vector<Shard> shards;
   shards.reserve(shard_fns.size());
