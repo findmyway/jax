@@ -238,14 +238,17 @@ def _run_scoped_resource_estimator(
           )
       )
     elif aval.memory_space == gpu_core.TMEM:
-      if aval.dtype.itemsize != 4:
-        raise ValueError("TMEM only supports 32-bit types.")
       if len(aval.shape) != 2:
-        raise ValueError("TMEM allocations must be 2D.")
+        raise ValueError(f"TMEM allocations must be 2D. Got {aval.shape}")
       if aval.shape[0] % tcgen05.TMEM_ROWS != 0:
-        raise ValueError("TMEM shape[0] must be a multiple of 128.")
-      if aval.shape[1] % 8 != 0:
-        raise ValueError("TMEM shape[1] must be a multiple of 8.")
+        raise ValueError(
+            f"TMEM shape[0] must be a multiple of 128. Got {aval.shape[0]}.")
+      packing = 4 // aval.dtype.itemsize
+      min_col = 8 * packing
+      if aval.shape[1] % min_col != 0:
+        raise ValueError(
+            f"TMEM shape[1] must be a multiple of {min_col}. "
+            f"Got {aval.shape[1]}.")
       rs += Resources(tmem_scratch_cols=aval.shape[1])
     elif aval.memory_space == gpu_core.SMEM:
       rs += Resources(
@@ -342,20 +345,22 @@ class ModuleContext:
   def alloc_tmem(
       self,
       struct: jax.ShapeDtypeStruct,
-      layout: tcgen05.TMEMLayout | None = None
+      layout: tcgen05.TMEMLayout | None = None,
+      collective: bool = False
   ) -> ir.Value:
-    if self.tmem_used_cols > 0:
-      raise NotImplementedError(
-          "Multiple TMEM allocations are not implemented.")
+    packing = 4 // struct.dtype.itemsize
     if layout is None:
-      layout = tcgen05._infer_tmem_layout(struct.shape, collective=False)
-    cols_used = np.prod(struct.shape) // tcgen05.TMEM_ROWS
+      layout = tcgen05._infer_tmem_layout(
+          struct.shape, collective, packing=packing)
+    cols_used = int(np.prod(struct.shape) // tcgen05.TMEM_ROWS // packing)
+    off = arith_dialect.addi(self.tmem_base_ptr,
+                             _i32_constant(self.tmem_used_cols))
+    tmem_ref = tcgen05.TMEMRef(
+        address=off,
+        shape=struct.shape,
+        dtype=mgpu_utils.dtype_to_ir_type(struct.dtype),
+        layout=layout)
     self.tmem_used_cols += cols_used
-    off = self.tmem_base_ptr
-    tmem_ref = tcgen05.TMEMRef(address=off,
-                               shape=struct.shape,
-                               dtype=mgpu_utils.dtype_to_ir_type(struct.dtype),
-                               layout=layout)
     yield tmem_ref
     self.tmem_used_cols -= cols_used
 
@@ -1282,17 +1287,32 @@ def _get_lowering_rule_wg(ctx: LoweringRuleContext, x_smem, *leaves, tree):
 
 @register_lowering_rule(sp.swap_p, mgpu.LoweringSemantics.Lane)
 def _swap_lowering_rule(
-    ctx: LoweringRuleContext, x_smem, value, *leaves, tree
+    ctx: LoweringRuleContext, x_ref, value, *leaves, tree
 ):
   if not isinstance(value, mgpu.FragmentedArray):
     raise TypeError(f"Can only store arrays (got {value}).")
-  if not isinstance(x_smem, ir.Value) and ir.MemRefType.isinstance(x_smem):
-    raise TypeError(f"Can only store to references (got {x_smem}).")
+
+  if isinstance(x_ref, tcgen05.TMEMRef):
+    transforms = jax.tree.unflatten(tree, leaves)
+    if len(transforms) != 1 or not isinstance(
+        transforms[0], indexing.NDIndexer):
+      raise NotImplementedError(
+          "Only a single indexing transform is supported for TMEM refs.")
+    indexer = cast(indexing.NDIndexer, transforms[0])
+    if not gpu_core.is_trivial_index(indexer.indices, x_ref.shape):
+      raise NotImplementedError(
+          "Only trivial indexing is supported for TMEM refs.")
+    old_value = x_ref[:]
+    x_ref[:] = value
+    return old_value
+
+  if not isinstance(x_ref, ir.Value) and ir.MemRefType.isinstance(x_ref):
+    raise TypeError(f"Can only store to references (got {x_ref}).")
   v_aval = ctx.avals_in[1]
   transforms = jax.tree.unflatten(tree, leaves)
   transposed_value = value.layout == mgpu.WGMMA_TRANSPOSED_LAYOUT
   x_smem, transforms = _handle_transforms(
-      x_smem, transforms, handle_transposes=not transposed_value
+      x_ref, transforms, handle_transposes=not transposed_value
   )
   match transforms:
     case (

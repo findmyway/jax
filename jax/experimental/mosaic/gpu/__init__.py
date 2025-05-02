@@ -100,3 +100,7 @@ from .wgmma import (
     WGMMAAccumulator as WGMMAAccumulator,
     wgmma as wgmma,
 )
+
+from .tcgen05 import (
+  LAYOUT as TCGEN05_LAYOUT,
+)
