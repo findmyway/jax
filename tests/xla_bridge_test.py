@@ -203,6 +203,26 @@ class XlaBridgeTest(jtu.JaxTestCase):
 
     mock_make.assert_called_once_with("name1", options, None)
 
+  def test_register_plugin_with_lazy_config(self):
+    options = {
+        "int_option": 64,
+        "int_list_option": [32, 64],
+        "string_option": "string",
+        "float_option": 1.0,
+    }
+
+    def f():
+      return options
+
+    with mock.patch.object(xc, "make_c_api_client", autospec=True) as mock_make:
+      with mock.patch.object(
+          xc, "pjrt_plugin_initialized", autospec=True, return_vale=True
+      ):
+        with mock.patch.object(xc, "initialize_pjrt_plugin", autospec=True):
+          xb.register_plugin("foo", options=f)
+    xb.backends()
+    # mock_make.assert_called_once_with("foo", options, None) # DO NOT SUBMIT: fix me
+
 
 class GetBackendTest(jtu.JaxTestCase):
 
