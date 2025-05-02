@@ -245,6 +245,7 @@ def pallas_call_tpu_lowering_rule(
       has_side_effects=mosaic_params.has_side_effects,
       output_memory_spaces=output_memory_spaces,
       disable_bounds_checks=mosaic_params.disable_bounds_checks,
+      active_core_count=None,
   )
   _maybe_cast_to_bool = lambda x, aval: x.astype(
       jax.numpy.bool_) if aval.dtype == jax.numpy.bool_ else x

@@ -125,6 +125,7 @@ class CustomCallBackendConfig:
   internal_scratch_in_bytes: int | None
   output_memory_spaces: tuple[MemorySpace | None, ...] | None
   disable_bounds_checks: bool
+  active_core_count: int | None
 
   # We omit the body while printing, because primitive params get embedded
   # in HLO metadata, and the body blows up its size.
@@ -212,6 +213,19 @@ class CustomCallBackendConfig:
         if i + 1 != len(self.flags):
           config.write(b",")
       config.write(b"]")
+    if (
+        self.device_type == "sparsecore"
+        and self.active_core_count is not None
+        and self.active_core_count > 0
+    ):
+      config.write(b', "megachip_parallelism_config": {"cores": ["')
+      config.write(
+          b'","'.join([
+              str(core).encode("ascii")
+              for core in range(self.active_core_count)
+          ])
+      )
+      config.write(b'"]}')
     config.write(b"}")
     return config.getvalue()
 
@@ -355,12 +369,81 @@ def _get_device_type(module: ir.Module) -> str | None:
   )
   if tensorcore_func_found and sparsecore_func_found:
     raise ValueError(
-        "A single Mosaic kernel cannot contain both "
-        "TensorCore and SparseCore functions."
+        "A single Mosaic kernel cannot contain both TensorCore and SparseCore"
+        " functions."
     )
   if sparsecore_func_found:
     return "sparsecore"
   return None
+
+
+def _get_active_core_count(module: ir.Module) -> int | None:
+
+  def get_core_parallel_dim_size(
+      dim_semantics: ir.ArrayAttr,
+      iter_bounds: ir.DenseI64ArrayAttr,
+      other_subkernel_core_dim_size: int | None = None) -> int | None:
+
+    if len(iter_bounds) != len(dim_semantics):
+      raise ValueError(
+          "The iteration bounds and dimension semantics attributes must have"
+          " the same number of elements."
+      )
+
+    subkernel_core_dim_size = None
+
+    for dim_idx, (dim_size, dim_sem) in enumerate(
+        zip(iter_bounds, dim_semantics)
+    ):
+      if str(dim_sem) != "#tpu.dimension_semantics<core_parallel>":
+        continue
+
+      if ir.ShapedType.is_dynamic_size(dim_size):
+        raise ValueError(
+            "The iteration bound corresponding to the core-parallel dimension "
+            f"{dim_idx} must be statically known."
+        )
+      if subkernel_core_dim_size is not None:
+        raise ValueError(
+            "A single Mosaic subkernel cannot contain multiple core sharding "
+            "dimensions."
+        )
+      if (
+          other_subkernel_core_dim_size is not None
+          and other_subkernel_core_dim_size != dim_size
+      ):
+        raise ValueError(
+            "The iteration bound corresponding to the core-parallel dimension "
+            "be the same across all subkernels."
+        )
+      subkernel_core_dim_size = dim_size
+
+    return subkernel_core_dim_size
+
+  core_parallel_dim_size = None
+
+  def find_core_parallel_dim_size(op: ir.Operation) -> ir.WalkResult:
+    nonlocal core_parallel_dim_size
+    if op.name != "func.func":
+      return ir.WalkResult.ADVANCE
+    if (
+        "iteration_bounds" in op.attributes
+        and "dimension_semantics" in op.attributes
+    ):
+      iter_bounds = ir.DenseI64ArrayAttr(op.attributes["iteration_bounds"])
+      dim_semantics = ir.ArrayAttr(op.attributes["dimension_semantics"])
+      core_parallel_dim_size = get_core_parallel_dim_size(
+          dim_semantics=dim_semantics,
+          iter_bounds=iter_bounds,
+          other_subkernel_core_dim_size=core_parallel_dim_size,
+      )
+      return ir.WalkResult.SKIP
+    return ir.WalkResult.ADVANCE
+
+  module.operation.walk(
+      find_core_parallel_dim_size, walk_order=ir.WalkOrder.PRE_ORDER
+  )
+  return 1 if core_parallel_dim_size == 1 else None
 
 
 def _lower_to_custom_call_config(
@@ -378,6 +461,7 @@ def _lower_to_custom_call_config(
     kernel_name: str | None = None,
     ir_version: int | None = None,
     disable_bounds_checks: bool = False,
+    active_core_count: int | None = None,
 ) -> CustomCallBackendConfig:
   device_type = _get_device_type(module)
   lowered_module_asm, (
@@ -408,6 +492,7 @@ def _lower_to_custom_call_config(
       needs_layout_passes=needs_layout_passes,
       output_memory_spaces=output_memory_spaces,
       disable_bounds_checks=disable_bounds_checks,
+      active_core_count=active_core_count,
   )
 
 
@@ -428,6 +513,7 @@ def _lowered_to_custom_call_config(
     device_type: str | None,
     output_memory_spaces: tuple[MemorySpace | None, ...] | None = None,
     disable_bounds_checks: bool = False,
+    active_core_count: int | None = None,
 ):
   if has_custom_barrier:
     if collective_id is None:
@@ -459,6 +545,7 @@ def _lowered_to_custom_call_config(
       internal_scratch_in_bytes,
       output_memory_spaces,
       disable_bounds_checks,
+      active_core_count=active_core_count,
   )
   return config
 
@@ -481,6 +568,7 @@ def lower_module_to_custom_call(
     serialization_format: int | None,
     output_memory_spaces: tuple[MemorySpace | None, ...] | None,
     disable_bounds_checks: bool = False,
+    active_core_count: int | None,
 ) -> Sequence[ir.Value]:
   config = _lower_to_custom_call_config(
       module,
@@ -496,6 +584,7 @@ def lower_module_to_custom_call(
       kernel_name=kernel_name,
       ir_version=get_ir_version(ctx),
       disable_bounds_checks=disable_bounds_checks,
+      active_core_count=active_core_count,
   )
   return _tpu_custom_call_lowering(
       ctx,
@@ -527,6 +616,7 @@ def as_tpu_kernel(
     disable_bounds_checks: bool = False,
 ) -> Callable[..., Any]:
   """Turns an MLIR Mosaic kernel into a JAX-compatible function."""
+  active_core_count = _get_active_core_count(module)
   config = _lower_to_custom_call_config(
       module,
       backend=backend,
@@ -540,6 +630,7 @@ def as_tpu_kernel(
       output_memory_spaces=output_memory_spaces,
       kernel_name=kernel_name,
       disable_bounds_checks=disable_bounds_checks,
+      active_core_count=active_core_count,
   )
   return _as_jax_callable(
       config,
